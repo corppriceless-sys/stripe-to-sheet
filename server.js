@@ -1,19 +1,23 @@
 /**
  * Stripe Webhook → スプレッドシート & 有料判定API
  * Render にデプロイする。
- * - POST /webhook: Stripe の Webhook 受信 → 「有料ユーザー」シートにメール追記
- * - GET /check?email=xxx: 有料判定（「有料ユーザー」A列にメールがあれば { paid: true }）
+ * - POST /webhook: Stripe の Webhook 受信 → 「有料ユーザー」シートに email / status / subscription_id を追加・更新
+ * - GET /check?email=xxx: 有料判定（status が active のときのみ { paid: true }、それ以外は { paid: false, status? }）
+ *
+ * シート「有料ユーザー」: A列=email（Googleアカウント）, B列=status（active/past_due/canceled）, C列=subscription_id（任意）
  *
  * 環境変数:
  *   STRIPE_WEBHOOK_SECRET   - Stripe ダッシュボードの Webhook 署名シークレット
  *   SPREADSHEET_ID          - 有料ユーザー一覧のスプレッドシート ID
  *   GOOGLE_APPLICATION_CREDENTIALS_JSON - サービスアカウント鍵 JSON の文字列（1行にしたもの）
+ *   GOOGLE_ACCOUNT_FIELD_KEY - （任意）Stripe Checkout の「Googleアカウント」カスタムフィールドの key。未設定時は最初の text カスタムフィールドを使用
  */
 
 const express = require('express');
 const Stripe = require('stripe');
 
 const SHEET_NAME = '有料ユーザー';
+const STATUS_ACTIVE = 'active';
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -21,6 +25,7 @@ const port = process.env.PORT || 3000;
 const stripeWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 const spreadsheetId = process.env.SPREADSHEET_ID;
 const credentialsJson = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
+const googleAccountFieldKey = process.env.GOOGLE_ACCOUNT_FIELD_KEY || '';
 
 // Webhook ルートだけ生 body で受け取る（署名検証のため）
 app.use('/webhook', express.raw({ type: 'application/json' }));
@@ -31,7 +36,8 @@ app.get('/health', (req, res) => {
 });
 
 /**
- * 有料判定: GET /check?email=xxx → { paid: true/false }
+ * 有料判定: GET /check?email=xxx → { paid: true/false, status?: string }
+ * status が 'active' のときのみ paid: true。past_due / canceled / 未登録は paid: false（必要なら status を返す）
  */
 app.get('/check', async (req, res) => {
   const email = (req.query.email && String(req.query.email).trim()) || '';
@@ -40,8 +46,9 @@ app.get('/check', async (req, res) => {
     return res.json(result);
   }
   try {
-    const paid = await checkPaidUserEmail(email);
+    const { paid, status } = await checkPaidUserEmail(email);
     result.paid = paid;
+    if (status) result.status = status;
   } catch (err) {
     console.error('check failed:', err.message);
   }
@@ -69,37 +76,87 @@ app.post('/webhook', async (req, res) => {
   }
 
   const eventType = event.type;
-  let email = null;
 
   if (eventType === 'checkout.session.completed') {
-    const obj = event.data?.object;
-    if (obj) {
-      email = obj.customer_email ?? obj.customer_details?.email ?? obj.customer_details?.customer_email;
+    const session = event.data?.object;
+    if (!session) {
+      res.json({ received: true });
+      return;
     }
+    const email = getGoogleEmailFromSession(session);
     if (!email) {
-      console.warn('checkout.session.completed: email not found. Keys:', obj ? Object.keys(obj).join(',') : 'no object');
+      console.warn('checkout.session.completed: Google account email not found. custom_fields:', JSON.stringify(session.custom_fields));
+      res.json({ received: true });
+      return;
     }
-  } else if (eventType === 'customer.subscription.created' || eventType === 'invoice.paid') {
-    const dataObj = event.data?.object;
-    if (dataObj) {
-      email = dataObj.customer_email ?? dataObj.customer_details?.email ?? dataObj.customer_details?.customer_email;
+    const normalized = String(email).trim().toLowerCase();
+    if (normalized.length === 0) {
+      res.json({ received: true });
+      return;
     }
+    const subscriptionId = (session.subscription && String(session.subscription)) || '';
+    try {
+      await upsertPaidUser(normalized, STATUS_ACTIVE, subscriptionId);
+    } catch (err) {
+      console.error('upsertPaidUser failed:', err);
+      return res.status(500).send('Append failed');
+    }
+    res.json({ received: true });
+    return;
   }
 
-  if (email) {
-    email = String(email).trim().toLowerCase();
-    if (email.length > 0) {
-      try {
-        await appendPaidUserEmail(email);
-      } catch (err) {
-        console.error('appendPaidUserEmail failed:', err);
-        return res.status(500).send('Append failed');
-      }
+  if (eventType === 'customer.subscription.updated') {
+    const subscription = event.data?.object;
+    if (!subscription || !subscription.id) {
+      res.json({ received: true });
+      return;
     }
+    const subId = String(subscription.id);
+    const status = (subscription.status && String(subscription.status)) || '';
+    try {
+      await updateStatusBySubscriptionId(subId, status);
+    } catch (err) {
+      console.error('updateStatusBySubscriptionId failed:', err);
+      return res.status(500).send('Update failed');
+    }
+    res.json({ received: true });
+    return;
   }
 
   res.json({ received: true });
 });
+
+/**
+ * Checkout Session から「アプリで使うGoogleアカウント」のメールを取得。
+ * カスタムフィールド（custom_fields）の text 値を優先。なければ customer_email にフォールバック。
+ */
+function getGoogleEmailFromSession(session) {
+  const customFields = session.custom_fields;
+  if (Array.isArray(customFields) && customFields.length > 0) {
+    for (const field of customFields) {
+      const key = (field.key && String(field.key).trim()) || '';
+      const matchKey = !googleAccountFieldKey || key === googleAccountFieldKey;
+      if (field.text && field.text.value && matchKey) {
+        const v = String(field.text.value).trim();
+        if (v.length > 0) return v;
+      }
+      if (field.dropdown && field.dropdown.value && matchKey) {
+        const v = String(field.dropdown.value).trim();
+        if (v.length > 0) return v;
+      }
+    }
+    // キー指定がなく、該当がなければ「最初の text カスタムフィールド」を使用
+    if (!googleAccountFieldKey) {
+      for (const field of customFields) {
+        if (field.text && field.text.value) {
+          const v = String(field.text.value).trim();
+          if (v.length > 0) return v;
+        }
+      }
+    }
+  }
+  return session.customer_email ?? session.customer_details?.email ?? session.customer_details?.customer_email ?? null;
+}
 
 /** Google Sheets API クライアントを取得 */
 function getSheetsClient() {
@@ -120,55 +177,117 @@ function getSheetsClient() {
   return { sheets: google.sheets({ version: 'v4', auth }), spreadsheetId };
 }
 
-/**
- * 「有料ユーザー」シートの A 列にメールが含まれるか判定
- */
-async function checkPaidUserEmail(email) {
-  const normalized = String(email).trim().toLowerCase();
-  if (!normalized) return false;
-  const { sheets } = getSheetsClient();
-  const range = `'${SHEET_NAME}'!A:A`;
-  const existing = await sheets.spreadsheets.values.get({
-    spreadsheetId,
-    range,
-  });
-  const rows = existing.data.values || [];
-  for (const row of rows) {
-    const v = (row[0] && String(row[0]).trim()) || '';
-    if (v.toLowerCase() === normalized) return true;
-  }
-  return false;
+/** 1行目がヘッダー（A列に "email" を含む）ならデータ行は2行目以降 */
+function getDataRows(rows) {
+  if (!rows || rows.length === 0) return [];
+  const first = (rows[0] && rows[0][0] && String(rows[0][0]).toLowerCase()) || '';
+  if (first.includes('email')) return rows.slice(1);
+  return rows;
 }
 
 /**
- * スプレッドシート「有料ユーザー」の A 列にメールを1行追加（重複は追加しない）
+ * 「有料ユーザー」シートで該当メールの行を探し、status が 'active' のときのみ paid: true を返す。
+ * 戻り値: { paid: boolean, status?: string }
  */
-async function appendPaidUserEmail(email) {
+async function checkPaidUserEmail(email) {
+  const normalized = String(email).trim().toLowerCase();
+  if (!normalized) return { paid: false };
   const { sheets } = getSheetsClient();
-
-  const range = `'${SHEET_NAME}'!A:A`;
+  const range = `'${SHEET_NAME}'!A:B`;
   const existing = await sheets.spreadsheets.values.get({
     spreadsheetId,
     range,
   });
-  const rows = existing.data.values || [];
-  const normalized = email.toLowerCase();
+  const rows = getDataRows(existing.data.values || []);
   for (const row of rows) {
-    const v = (row[0] && String(row[0]).trim()) || '';
-    if (v.toLowerCase() === normalized) {
-      console.log('appendPaidUserEmail: already exists, skip:', email);
+    const colA = (row[0] && String(row[0]).trim()) || '';
+    if (colA.toLowerCase() !== normalized) continue;
+    const status = (row[1] && String(row[1]).trim()) || '';
+    // B列が空の行は従来の「A列のみ」データとみなし active 扱い
+    const effectiveStatus = status || STATUS_ACTIVE;
+    return {
+      paid: effectiveStatus.toLowerCase() === STATUS_ACTIVE,
+      status: effectiveStatus || undefined,
+    };
+  }
+  return { paid: false };
+}
+
+/**
+ * スプレッドシート「有料ユーザー」に (email, status, subscription_id) を追加または更新。
+ * A=email, B=status, C=subscription_id。同一 email が既にあればその行の B,C を更新。
+ */
+async function upsertPaidUser(email, status, subscriptionId) {
+  const { sheets } = getSheetsClient();
+  const range = `'${SHEET_NAME}'!A:C`;
+  const existing = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range,
+  });
+  const allRows = existing.data.values || [];
+  const rows = getDataRows(allRows);
+  const headerOffset = allRows.length - rows.length;
+  const normalized = String(email).trim().toLowerCase();
+  const subId = subscriptionId ? String(subscriptionId).trim() : '';
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const colA = (row[0] && String(row[0]).trim()) || '';
+    if (colA.toLowerCase() === normalized) {
+      const rowIndex = headerOffset + i + 1;
+      await sheets.spreadsheets.values.update({
+        spreadsheetId,
+        range: `'${SHEET_NAME}'!B${rowIndex}:C${rowIndex}`,
+        valueInputOption: 'RAW',
+        requestBody: { values: [[status, subId]] },
+      });
+      console.log('upsertPaidUser: updated row', rowIndex, email, status, subId || '(no sub)');
       return;
     }
   }
 
   await sheets.spreadsheets.values.append({
     spreadsheetId,
-    range: `'${SHEET_NAME}'!A:A`,
+    range: `'${SHEET_NAME}'!A:C`,
     valueInputOption: 'RAW',
     insertDataOption: 'INSERT_ROWS',
-    requestBody: { values: [[email]] },
+    requestBody: { values: [[email, status, subId]] },
   });
-  console.log('appendPaidUserEmail: appended:', email);
+  console.log('upsertPaidUser: appended', email, status, subId || '(no sub)');
+}
+
+/**
+ * subscription_id（C列）で行を検索し、その行の status（B列）を更新する。
+ */
+async function updateStatusBySubscriptionId(subscriptionId, status) {
+  if (!subscriptionId || !status) return;
+  const { sheets } = getSheetsClient();
+  const range = `'${SHEET_NAME}'!A:C`;
+  const existing = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range,
+  });
+  const allRows = existing.data.values || [];
+  const rows = getDataRows(allRows);
+  const headerOffset = allRows.length - rows.length;
+  const subId = String(subscriptionId).trim();
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const colC = (row[2] && String(row[2]).trim()) || '';
+    if (colC === subId) {
+      const rowIndex = headerOffset + i + 1;
+      await sheets.spreadsheets.values.update({
+        spreadsheetId,
+        range: `'${SHEET_NAME}'!B${rowIndex}`,
+        valueInputOption: 'RAW',
+        requestBody: { values: [[status]] },
+      });
+      console.log('updateStatusBySubscriptionId: row', rowIndex, subId, '->', status);
+      return;
+    }
+  }
+  console.warn('updateStatusBySubscriptionId: no row found for subscription_id', subId);
 }
 
 if (!stripeWebhookSecret || !spreadsheetId || !credentialsJson) {
