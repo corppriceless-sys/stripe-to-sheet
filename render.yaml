@@ -1,0 +1,11 @@
+# Render Blueprint（任意）
+# リポジトリ接続時に Root Directory を "stripe-to-sheet" にし、このファイルがある状態で
+# Dashboard → Blueprint で「New Blueprint Instance」から読み込めます。
+# 環境変数は Dashboard の Environment で手動設定してください。
+
+services:
+  - type: web
+    name: stripe-to-sheet
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
