@@ -1,7 +1,7 @@
 /**
  * Stripe Webhook → スプレッドシート & 有料判定API
  * Render にデプロイする。
- * - POST /webhook: Stripe の Webhook 受信 → 「有料ユーザー」シートに email / status / subscription_id を追加・更新
+ * - POST /webhook: Stripe の Webhook 受信 → 「有料ユーザー」シートに email / status / subscription_id / payment_email を追加・更新
  * - GET /check?email=xxx: 有料判定（status が active のときのみ { paid: true }、それ以外は { paid: false, status? }）
  *
  * シート「有料ユーザー」: A列=email（Googleアカウント）, B列=status（active/past_due/canceled）, C列=subscription_id（任意）
@@ -122,8 +122,11 @@ app.post('/webhook', async (req, res) => {
       return;
     }
     const subscriptionId = (session.subscription && String(session.subscription)) || '';
+    // 支払いメールアドレスを取得（D列に保存するため）
+    const paymentEmail = session.customer_email || session.customer_details?.email || session.customer_details?.customer_email || '';
+    const normalizedPaymentEmail = paymentEmail ? String(paymentEmail).trim().toLowerCase() : '';
     try {
-      await upsertPaidUser(normalized, STATUS_ACTIVE, subscriptionId);
+      await upsertPaidUser(normalized, STATUS_ACTIVE, subscriptionId, normalizedPaymentEmail);
     } catch (err) {
       console.error('upsertPaidUser failed:', err);
       return res.status(500).send('Append failed');
@@ -292,12 +295,13 @@ async function checkPaidUserEmail(email) {
 }
 
 /**
- * スプレッドシート「有料ユーザー」に (email, status, subscription_id) を追加または更新。
- * A=email, B=status, C=subscription_id。同一 email が既にあればその行の B,C を更新。
+ * スプレッドシート「有料ユーザー」に (email, status, subscription_id, payment_email) を追加または更新。
+ * A=email（Googleアカウント）, B=status, C=subscription_id, D=payment_email（支払いメールアドレス）。
+ * 同一 email が既にあればその行の B,C,D を更新。
  */
-async function upsertPaidUser(email, status, subscriptionId) {
+async function upsertPaidUser(email, status, subscriptionId, paymentEmail = '') {
   const { sheets } = getSheetsClient();
-  const range = `'${SHEET_NAME}'!A:C`;
+  const range = `'${SHEET_NAME}'!A:D`;
   const existing = await sheets.spreadsheets.values.get({
     spreadsheetId,
     range,
@@ -307,6 +311,7 @@ async function upsertPaidUser(email, status, subscriptionId) {
   const headerOffset = allRows.length - rows.length;
   const normalized = String(email).trim().toLowerCase();
   const subId = subscriptionId ? String(subscriptionId).trim() : '';
+  const paymentEmailNormalized = paymentEmail ? String(paymentEmail).trim().toLowerCase() : '';
 
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
@@ -315,23 +320,23 @@ async function upsertPaidUser(email, status, subscriptionId) {
       const rowIndex = headerOffset + i + 1;
       await sheets.spreadsheets.values.update({
         spreadsheetId,
-        range: `'${SHEET_NAME}'!B${rowIndex}:C${rowIndex}`,
+        range: `'${SHEET_NAME}'!B${rowIndex}:D${rowIndex}`,
         valueInputOption: 'RAW',
-        requestBody: { values: [[status, subId]] },
+        requestBody: { values: [[status, subId, paymentEmailNormalized]] },
       });
-      console.log('upsertPaidUser: updated row', rowIndex, email, status, subId || '(no sub)');
+      console.log('upsertPaidUser: updated row', rowIndex, email, status, subId || '(no sub)', paymentEmailNormalized || '(no payment email)');
       return;
     }
   }
 
   await sheets.spreadsheets.values.append({
     spreadsheetId,
-    range: `'${SHEET_NAME}'!A:C`,
+    range: `'${SHEET_NAME}'!A:D`,
     valueInputOption: 'RAW',
     insertDataOption: 'INSERT_ROWS',
-    requestBody: { values: [[email, status, subId]] },
+    requestBody: { values: [[email, status, subId, paymentEmailNormalized]] },
   });
-  console.log('upsertPaidUser: appended', email, status, subId || '(no sub)');
+  console.log('upsertPaidUser: appended', email, status, subId || '(no sub)', paymentEmailNormalized || '(no payment email)');
 }
 
 /**
@@ -343,7 +348,7 @@ async function updateStatusBySubscriptionId(subscriptionId, status) {
     return;
   }
   const { sheets } = getSheetsClient();
-  const range = `'${SHEET_NAME}'!A:C`;
+  const range = `'${SHEET_NAME}'!A:D`;
   console.log('updateStatusBySubscriptionId: searching for subscription_id', subscriptionId, 'in range', range);
   
   const existing = await sheets.spreadsheets.values.get({
