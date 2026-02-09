@@ -91,6 +91,18 @@ app.post('/webhook', async (req, res) => {
   }
 
   const eventType = event.type;
+  
+  // デバッグ: 受信したすべてのイベントをログに記録
+  console.log('Webhook received:', eventType, {
+    id: event.id,
+    created: event.created,
+    data: event.data ? {
+      object: event.data.object ? {
+        id: event.data.object.id,
+        object: event.data.object.object
+      } : null
+    } : null
+  });
 
   if (eventType === 'checkout.session.completed') {
     const session = event.data?.object;
@@ -136,6 +148,47 @@ app.post('/webhook', async (req, res) => {
     }
     res.json({ received: true });
     return;
+  }
+
+  if (eventType === 'customer.subscription.deleted') {
+    const subscription = event.data?.object;
+    if (!subscription || !subscription.id) {
+      res.json({ received: true });
+      return;
+    }
+    const subId = String(subscription.id);
+    try {
+      // サブスクリプション削除時は status を 'canceled' に更新
+      await updateStatusBySubscriptionId(subId, 'canceled');
+    } catch (err) {
+      console.error('updateStatusBySubscriptionId (deleted) failed:', err);
+      return res.status(500).send('Update failed');
+    }
+    res.json({ received: true });
+    return;
+  }
+
+  if (eventType === 'customer.deleted') {
+    const customer = event.data?.object;
+    console.log('customer.deleted event received:', {
+      customerId: customer?.id,
+      email: customer?.email,
+      deleted: customer?.deleted
+    });
+    
+    // 注意: customer.deleted イベントでは subscription_id が直接取得できません
+    // 通常、顧客を削除すると customer.subscription.deleted イベントが先に発生するため、
+    // そちらで処理されます
+    // ここではログのみ記録します
+    console.warn('customer.deleted: subscription_id が取得できないため、customer.subscription.deleted で処理してください');
+    
+    res.json({ received: true });
+    return;
+  }
+
+  // 未処理のイベントタイプをログに記録（デバッグ用）
+  if (!['checkout.session.completed', 'customer.subscription.updated', 'customer.subscription.deleted', 'customer.deleted'].includes(eventType)) {
+    console.log('Unhandled event type:', eventType);
   }
 
   res.json({ received: true });
@@ -303,6 +356,18 @@ async function updateStatusBySubscriptionId(subscriptionId, status) {
     }
   }
   console.warn('updateStatusBySubscriptionId: no row found for subscription_id', subId);
+}
+
+/**
+ * customer_id で行を検索し、その行の status（B列）を更新する。
+ * 注意: customer.deleted イベントでは subscription_id が取得できない場合があるため、
+ * この関数は限定的に使用されます。通常は customer.subscription.deleted イベントで処理されます。
+ */
+async function updateStatusByCustomerId(customerId, status) {
+  if (!customerId || !status) return;
+  // customer.deleted イベントでは subscription_id が直接取得できないため、
+  // この関数は実装が困難です。代わりに customer.subscription.deleted イベントを使用してください。
+  console.warn('updateStatusByCustomerId: customer.deleted イベントでは subscription_id が取得できないため、この関数は使用されません。customer.subscription.deleted イベントで処理してください。');
 }
 
 if (!stripeWebhookSecret || !spreadsheetId || !credentialsJson) {
