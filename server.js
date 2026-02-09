@@ -152,14 +152,24 @@ app.post('/webhook', async (req, res) => {
 
   if (eventType === 'customer.subscription.deleted') {
     const subscription = event.data?.object;
+    console.log('customer.subscription.deleted event received:', {
+      subscriptionId: subscription?.id,
+      customerId: subscription?.customer,
+      status: subscription?.status,
+      canceledAt: subscription?.canceled_at
+    });
+    
     if (!subscription || !subscription.id) {
+      console.warn('customer.subscription.deleted: subscription.id is missing');
       res.json({ received: true });
       return;
     }
     const subId = String(subscription.id);
     try {
       // サブスクリプション削除時は status を 'canceled' に更新
+      console.log('Updating status to canceled for subscription_id:', subId);
       await updateStatusBySubscriptionId(subId, 'canceled');
+      console.log('Successfully updated status to canceled for subscription_id:', subId);
     } catch (err) {
       console.error('updateStatusBySubscriptionId (deleted) failed:', err);
       return res.status(500).send('Update failed');
@@ -328,9 +338,14 @@ async function upsertPaidUser(email, status, subscriptionId) {
  * subscription_id（C列）で行を検索し、その行の status（B列）を更新する。
  */
 async function updateStatusBySubscriptionId(subscriptionId, status) {
-  if (!subscriptionId || !status) return;
+  if (!subscriptionId || !status) {
+    console.warn('updateStatusBySubscriptionId: missing subscriptionId or status', { subscriptionId, status });
+    return;
+  }
   const { sheets } = getSheetsClient();
   const range = `'${SHEET_NAME}'!A:C`;
+  console.log('updateStatusBySubscriptionId: searching for subscription_id', subscriptionId, 'in range', range);
+  
   const existing = await sheets.spreadsheets.values.get({
     spreadsheetId,
     range,
@@ -339,23 +354,27 @@ async function updateStatusBySubscriptionId(subscriptionId, status) {
   const rows = getDataRows(allRows);
   const headerOffset = allRows.length - rows.length;
   const subId = String(subscriptionId).trim();
+  
+  console.log('updateStatusBySubscriptionId: found', rows.length, 'data rows (excluding header)');
 
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
     const colC = (row[2] && String(row[2]).trim()) || '';
+    console.log('updateStatusBySubscriptionId: checking row', i + 1, 'subscription_id:', colC, 'match:', colC === subId);
     if (colC === subId) {
       const rowIndex = headerOffset + i + 1;
+      console.log('updateStatusBySubscriptionId: found matching row at index', rowIndex, 'updating status to', status);
       await sheets.spreadsheets.values.update({
         spreadsheetId,
         range: `'${SHEET_NAME}'!B${rowIndex}`,
         valueInputOption: 'RAW',
         requestBody: { values: [[status]] },
       });
-      console.log('updateStatusBySubscriptionId: row', rowIndex, subId, '->', status);
+      console.log('updateStatusBySubscriptionId: successfully updated row', rowIndex, 'subscription_id', subId, '-> status', status);
       return;
     }
   }
-  console.warn('updateStatusBySubscriptionId: no row found for subscription_id', subId);
+  console.warn('updateStatusBySubscriptionId: no row found for subscription_id', subId, 'Available subscription_ids:', rows.map(r => r[2]).filter(Boolean));
 }
 
 /**
