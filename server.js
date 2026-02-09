@@ -31,6 +31,20 @@ const googleAccountFieldKey = process.env.GOOGLE_ACCOUNT_FIELD_KEY || '';
 app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 
+// CORS ヘッダーを設定（/check エンドポイント用）
+app.use((req, res, next) => {
+  // /check と /health エンドポイントにCORSヘッダーを追加
+  if (req.path === '/check' || req.path === '/health') {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type');
+  }
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
 app.get('/health', (req, res) => {
   res.json({ ok: true, service: 'stripe-to-sheet' });
 });
@@ -38,6 +52,7 @@ app.get('/health', (req, res) => {
 /**
  * 有料判定: GET /check?email=xxx → { paid: true/false, status?: string }
  * status が 'active' のときのみ paid: true。past_due / canceled / 未登録は paid: false（必要なら status を返す）
+ * Google OAuth で取得したメールアドレス（Googleアカウント）でスプレッドシートのA列と照合
  */
 app.get('/check', async (req, res) => {
   const email = (req.query.email && String(req.query.email).trim()) || '';
